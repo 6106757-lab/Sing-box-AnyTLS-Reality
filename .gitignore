@@ -1,0 +1,7 @@
+# 忽略宿主机本地的持久化数据目录
+data/
+
+# 忽略 python 编译缓存
+__pycache__/
+*.pyc
+.DS_Store
