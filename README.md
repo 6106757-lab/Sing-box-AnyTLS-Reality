@@ -114,7 +114,7 @@ version: "3"
 
 services:
   singbox-panel:
-    image: ghcr.io/你的GitHub用户名/anytls-singbox:latest
+    image: ghcr.io/6106757-lab/sing-box-anytls-reality:latest
     container_name: anytls-singbox-panel
 
     restart: always
@@ -255,7 +255,7 @@ git branch -M main
 关联远程仓库：
 
 ```bash
-git remote add origin https://github.com/你的GitHub用户名/anytls-singbox.git
+git remote add origin https://github.com/6106757-lab/anytls-singbox.git
 ```
 
 推送代码：
