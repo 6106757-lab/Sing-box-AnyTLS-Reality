@@ -124,12 +124,7 @@ services:
     volumes:
       - ./data:/etc/sing-box
 ```
-docker run -d \
-  --name anytls-singbox-panel \
-  --restart always \
-  --network host \
-  -v /opt/sing-box/data:/etc/sing-box \
-  ghcr.io/6106757-lab/sing-box-anytls-reality:latest
+docker run -d --name anytls-singbox-panel --restart always --network host -v /opt/sing-box/data:/etc/sing-box ghcr.io/6106757-lab/sing-box-anytls-reality:latest
   
 ### 参数说明
 
