@@ -62,40 +62,59 @@ def restart_singbox_kernel():
 # 加载配置
 def load_config_data():
     config = {
-        'port': '443',
         'users': [('admin', 'adminpassword')],
         'padding_scheme': "stop=3\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-        'server_name': 'yahoo.com',
+        'server_ip': get_server_ip(),
+        
+        # Reality 默认参数
+        'reality_enabled': False,
+        'reality_port': '443',
+        'reality_sni': 'yahoo.com',
         'private_key': '',
         'public_key': get_file_content(PUB_KEY_PATH),
         'short_id': '',
-        'server_ip': get_server_ip()
+        
+        # Standard TLS 默认参数
+        'tls_enabled': False,
+        'tls_port': '8443',
+        'tls_sni': 'yourdomain.com',
+        'cert_path': '/etc/sing-box/cert.pem',
+        'key_path': '/etc/sing-box/key.pem',
     }
     
     if os.path.exists(CONFIG_PATH):
         try:
             with open(CONFIG_PATH, 'r') as f:
                 data = json.load(f)
-            inbound = data['inbounds'][0]
-            config['port'] = str(inbound.get('listen_port', 443))
+            inbounds = data.get('inbounds', [])
             
-            # 解析用户
-            users_list = []
-            for u in inbound.get('users', []):
-                users_list.append((u.get('name'), u.get('password')))
-            if users_list:
-                config['users'] = users_list
-                
-            # 解析混淆策略
-            config['padding_scheme'] = '\n'.join(inbound.get('padding_scheme', []))
+            # 解析共享数据（从第一个可用的 inbound 获取账号和混淆策略）
+            if inbounds:
+                first_ib = inbounds[0]
+                users_list = []
+                for u in first_ib.get('users', []):
+                    users_list.append((u.get('name'), u.get('password')))
+                if users_list:
+                    config['users'] = users_list
+                config['padding_scheme'] = '\n'.join(first_ib.get('padding_scheme', []))
             
-            # 解析 Reality
-            tls = inbound.get('tls', {})
-            config['server_name'] = tls.get('server_name', 'yahoo.com')
-            
-            reality = tls.get('reality', {})
-            config['private_key'] = reality.get('private_key', '')
-            config['short_id'] = reality.get('short_id', '')
+            # 遍历解析具体的安全服务模式
+            for ib in inbounds:
+                tls = ib.get('tls', {})
+                reality = tls.get('reality', {})
+                if tls.get('enabled') and reality.get('enabled'):
+                    config['reality_enabled'] = True
+                    config['reality_port'] = str(ib.get('listen_port', 443))
+                    config['reality_sni'] = tls.get('server_name', 'yahoo.com')
+                    config['private_key'] = reality.get('private_key', '')
+                    config['short_id'] = reality.get('short_id', '')
+                elif tls.get('enabled'):
+                    config['tls_enabled'] = True
+                    config['tls_port'] = str(ib.get('listen_port', 8443))
+                    config['tls_sni'] = tls.get('server_name', 'yourdomain.com')
+                    config['cert_path'] = tls.get('certificate_path', '/etc/sing-box/cert.pem')
+                    config['key_path'] = tls.get('key_path', '/etc/sing-box/key.pem')
+                    
         except Exception as e:
             print("解析 config.json 失败:", e)
             
@@ -105,7 +124,7 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Sing-box Reality 旗舰版面板</title>
+    <title>Sing-box AnyTLS 融合版双服务面板</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.tailwindcss.com"></script>
@@ -117,8 +136,8 @@ HTML_TEMPLATE = """
             <!-- 导航 -->
             <div class="flex justify-between items-center border-b pb-4 mb-6">
                 <div>
-                    <h1 class="text-2xl font-bold text-indigo-600">Sing-box AnyTLS+Reality 面板</h1>
-                    <p class="text-xs text-gray-400 mt-1">集成一键生成 Reality 密钥对、Short ID 与动态订阅</p>
+                    <h1 class="text-2xl font-bold text-indigo-600">Sing-box AnyTLS 融合版面板</h1>
+                    <p class="text-xs text-gray-400 mt-1">支持 AnyTLS + Reality 与 AnyTLS + TLS 证书服务同时独立运行</p>
                 </div>
                 <div class="flex gap-2">
                     <button onclick="openTab('config-tab')" class="text-sm bg-indigo-50 text-indigo-700 px-4 py-2 rounded font-semibold">系统配置</button>
@@ -132,7 +151,7 @@ HTML_TEMPLATE = """
                 <!-- 动态订阅 -->
                 <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4">
                     <h3 class="text-sm font-bold text-indigo-800 mb-1">🔗 我的动态订阅链接</h3>
-                    <p class="text-xs text-indigo-600 mb-2">一键复制此链接贴入 NekoBox / v2rayN 等，将自动同步配置并带有公钥参数：</p>
+                    <p class="text-xs text-indigo-600 mb-2">一键复制此链接。订阅将自动输出当前所有开启状态的服务节点：</p>
                     <div class="flex gap-2">
                         <input type="text" id="subUrlInput" readonly class="flex-1 bg-white border border-indigo-300 rounded px-3 py-1.5 text-xs text-gray-600 outline-none">
                         <button type="button" onclick="copySubUrl()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-4 rounded shadow">复制订阅</button>
@@ -142,47 +161,84 @@ HTML_TEMPLATE = """
                 <form id="configForm" class="space-y-6">
                     <!-- 基本网络配置 -->
                     <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <h3 class="text-sm font-bold text-gray-700 border-b pb-1">🌐 核心服务参数</h3>
-                        <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+                        <h3 class="text-sm font-bold text-gray-700 border-b pb-1">🌐 核心公共参数</h3>
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-xs font-semibold text-gray-600 mb-1">服务器 IP (用于节点导出)</label>
                                 <input type="text" name="server_ip" value="{{ config.server_ip }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" required>
                             </div>
-                            <div>
-                                <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (Port)</label>
-                                <input type="number" name="port" id="portInput" value="{{ config.port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" required min="1" max="65535">
+                        </div>
+                    </div>
+
+                    <!-- 服务 1: Reality -->
+                    <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
+                        <div class="flex items-center justify-between border-b pb-1">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" name="reality_enabled" id="realityEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" {% if config.reality_enabled %}checked{% endif %}>
+                                <label for="realityEnabledCheckbox" class="text-sm font-bold text-gray-700 cursor-pointer">服务一: AnyTLS + Reality 模式</label>
+                            </div>
+                            <button type="button" onclick="generateNewKeys()" class="text-[11px] bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100">
+                                🔄 重新生成 Reality 密钥对
+                            </button>
+                        </div>
+                        
+                        <div id="realityFields" class="space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (Reality Port)</label>
+                                    <input type="number" name="reality_port" id="realityPortInput" value="{{ config.reality_port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" min="1" max="65535">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">目标伪装域名 (Reality SNI)</label>
+                                    <input type="text" name="reality_sni" id="realitySniInput" value="{{ config.reality_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none">
+                                </div>
                             </div>
                             <div>
-                                <label class="block text-xs font-semibold text-gray-600 mb-1">伪装目标域名 (server_name)</label>
-                                <input type="text" name="server_name" id="serverNameInput" value="{{ config.server_name }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" required>
+                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">服务端私钥 (private_key - 绝对保密)</label>
+                                <input type="text" name="private_key" id="privateKeyInput" value="{{ config.private_key }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none" readonly>
+                            </div>
+                            <div>
+                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">客户端公钥 (public_key - 客户端链接需要)</label>
+                                <input type="text" name="public_key" id="publicKeyInput" value="{{ config.public_key }}" class="w-full border bg-white rounded px-3 py-1.5 text-xs font-mono outline-none" readonly>
+                            </div>
+                            <div>
+                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">短期握手标识 ID (short_id)</label>
+                                <div class="flex gap-2">
+                                    <input type="text" name="short_id" id="shortIdInput" value="{{ config.short_id }}" class="flex-1 border rounded px-3 py-1.5 text-xs font-mono outline-none">
+                                    <button type="button" onclick="generateNewShortId()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded text-xs">随机</button>
+                                </div>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Reality 密钥专属管理板块 -->
+                    <!-- 服务 2: Standard TLS -->
                     <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <div class="flex justify-between items-center border-b pb-1">
-                            <h3 class="text-sm font-bold text-gray-700">🔑 Reality 密钥与安全管理</h3>
-                            <button type="button" onclick="generateNewKeys()" class="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-3 py-1 rounded font-semibold border border-indigo-100">
-                                🔄 重新生成全新密钥对
-                            </button>
+                        <div class="flex items-center justify-between border-b pb-1">
+                            <div class="flex items-center gap-2">
+                                <input type="checkbox" name="tls_enabled" id="tlsEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" {% if config.tls_enabled %}checked{% endif %}>
+                                <label for="tlsEnabledCheckbox" class="text-sm font-bold text-gray-700 cursor-pointer">服务二: AnyTLS + Standard TLS 证书模式</label>
+                            </div>
                         </div>
-                        <div class="space-y-3">
-                            <div>
-                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">服务端私钥 (private_key - 绝对保密)</label>
-                                <input type="text" name="private_key" id="privateKeyInput" value="{{ config.private_key }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none" required readonly>
-                            </div>
-                            <div>
-                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">客户端公钥 (public_key - 用于客户端导出分享)</label>
-                                <input type="text" name="public_key" id="publicKeyInput" value="{{ config.public_key }}" class="w-full border bg-white rounded px-3 py-1.5 text-xs font-mono outline-none" required readonly>
-                            </div>
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
+                        
+                        <div id="tlsFields" class="space-y-3">
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
-                                    <label class="block text-[11px] font-semibold text-gray-500 mb-1">短期握手标识 ID (short_id)</label>
-                                    <div class="flex gap-2">
-                                        <input type="text" name="short_id" id="shortIdInput" value="{{ config.short_id }}" class="flex-1 border rounded px-3 py-1.5 text-xs font-mono outline-none" required>
-                                        <button type="button" onclick="generateNewShortId()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded text-xs">随机</button>
-                                    </div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (TLS Port)</label>
+                                    <input type="number" name="tls_port" id="tlsPortInput" value="{{ config.tls_port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" min="1" max="65535">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">您的解析域名 (TLS SNI)</label>
+                                    <input type="text" name="tls_sni" id="tlsSniInput" value="{{ config.tls_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none">
+                                </div>
+                            </div>
+                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">证书文件路径 (certificate_path - 必须为 fullchain)</label>
+                                    <input type="text" name="cert_path" id="certPathInput" value="{{ config.cert_path }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">私钥文件路径 (key_path - 私钥文件)</label>
+                                    <input type="text" name="key_path" id="keyPathInput" value="{{ config.key_path }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none">
                                 </div>
                             </div>
                         </div>
@@ -238,23 +294,36 @@ HTML_TEMPLATE = """
         </div>
     </div>
 
-    <!-- 二维码弹窗 -->
+    <!-- 二维码与一键导入弹窗 -->
     <div id="shareModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center hidden p-4 z-50">
-        <div class="bg-white rounded-xl shadow-lg max-w-md w-full p-6 space-y-4">
+        <div class="bg-white rounded-xl shadow-lg max-w-lg w-full p-6 space-y-4 overflow-y-auto max-h-[90vh]">
             <div class="flex justify-between items-center border-b pb-2">
                 <h3 class="font-bold text-gray-800 text-lg">节点一键导入</h3>
                 <button onclick="closeShare()" class="text-gray-400 hover:text-gray-600 text-xl font-bold">&times;</button>
             </div>
-            <div>
-                <p class="text-xs text-gray-500 mb-1">一键导入链接：</p>
+            
+            <!-- Reality 节点分享区 -->
+            <div id="modalRealitySection" class="hidden space-y-2 border-b pb-4">
+                <h4 class="font-bold text-sm text-indigo-700">🟢 AnyTLS + Reality 节点</h4>
                 <div class="flex gap-1">
-                    <input type="text" id="shareUrlInput" readonly class="flex-1 border bg-gray-50 rounded px-2 py-1 text-xs outline-none">
-                    <button onclick="copyShareUrl()" class="bg-indigo-600 text-white text-xs px-3 py-1 rounded">复制</button>
+                    <input type="text" id="shareUrlReality" readonly class="flex-1 border bg-gray-50 rounded px-2 py-1 text-xs outline-none">
+                    <button onclick="copyToClipboard('shareUrlReality')" class="bg-indigo-600 text-white text-xs px-3 py-1 rounded">复制</button>
+                </div>
+                <div class="flex flex-col items-center justify-center p-2 bg-gray-50 rounded">
+                    <div id="qrcodeReality" class="border p-1 bg-white rounded"></div>
                 </div>
             </div>
-            <div class="flex flex-col items-center justify-center p-4 bg-gray-50 rounded">
-                <span class="text-xs text-gray-500 mb-2">使用客户端扫码直连：</span>
-                <div id="qrcode" class="border p-2 bg-white rounded"></div>
+
+            <!-- Standard TLS 节点分享区 -->
+            <div id="modalTlsSection" class="hidden space-y-2">
+                <h4 class="font-bold text-sm text-green-700">🟢 AnyTLS + Standard TLS 证书节点</h4>
+                <div class="flex gap-1">
+                    <input type="text" id="shareUrlTls" readonly class="flex-1 border bg-gray-50 rounded px-2 py-1 text-xs outline-none">
+                    <button onclick="copyToClipboard('shareUrlTls')" class="bg-green-600 text-white text-xs px-3 py-1 rounded">复制</button>
+                </div>
+                <div class="flex flex-col items-center justify-center p-2 bg-gray-50 rounded">
+                    <div id="qrcodeTls" class="border p-1 bg-white rounded"></div>
+                </div>
             </div>
         </div>
     </div>
@@ -264,6 +333,39 @@ HTML_TEMPLATE = """
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.getElementById(tabId).classList.remove('hidden');
         }
+
+        // 切换启用服务的表单元素可用状态
+        function toggleServiceBlocks() {
+            const rEnabled = document.getElementById('realityEnabledCheckbox').checked;
+            const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
+            
+            const rFields = document.getElementById('realityFields');
+            const tFields = document.getElementById('tlsFields');
+            
+            if (rEnabled) {
+                rFields.classList.remove('opacity-50');
+                rFields.querySelectorAll('input, button').forEach(el => el.disabled = false);
+            } else {
+                rFields.classList.add('opacity-50');
+                rFields.querySelectorAll('input, button').forEach(el => {
+                    if (el.id !== 'realityEnabledCheckbox') el.disabled = true;
+                });
+            }
+            
+            if (tEnabled) {
+                tFields.classList.remove('opacity-50');
+                tFields.querySelectorAll('input').forEach(el => el.disabled = false);
+            } else {
+                tFields.classList.add('opacity-50');
+                tFields.querySelectorAll('input').forEach(el => {
+                    if (el.id !== 'tlsEnabledCheckbox') el.disabled = true;
+                });
+            }
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            toggleServiceBlocks();
+        });
 
         function addUserRow() {
             const container = document.getElementById('usersContainer');
@@ -288,7 +390,7 @@ HTML_TEMPLATE = """
         }
 
         function generateNewKeys() {
-            if(!confirm("确定要重新生成 Reality 密钥对吗？这会让旧节点连接失效！")) return;
+            if(!confirm("确定要重新生成 Reality 密钥对吗？这会让旧的 Reality 节点失效！")) return;
             fetch('/generate_keys')
             .then(res => res.json())
             .then(data => {
@@ -308,6 +410,24 @@ HTML_TEMPLATE = """
         // 保存配置
         document.getElementById('configForm').addEventListener('submit', function(e) {
             e.preventDefault();
+            
+            const rEnabled = document.getElementById('realityEnabledCheckbox').checked;
+            const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
+            
+            if(!rEnabled && !tEnabled) {
+                alert("请至少启用一个服务模块（Reality 或 Standard TLS）！");
+                return;
+            }
+            
+            if(rEnabled && tEnabled) {
+                const rp = document.getElementById('realityPortInput').value;
+                const tp = document.getElementById('tlsPortInput').value;
+                if(rp === tp) {
+                    alert("Reality 端口与 Standard TLS 端口不能相同，请分别指定不同的端口。");
+                    return;
+                }
+            }
+
             const status = document.getElementById('statusMsg');
             status.className = "text-sm font-semibold text-blue-600";
             status.innerText = "正在应用配置并重启内核中...";
@@ -349,7 +469,7 @@ HTML_TEMPLATE = """
             });
         });
 
-        // 订阅配置
+        // 订阅配置路径
         const host = window.location.hostname;
         const panelPort = window.location.port ? ":" + window.location.port : "";
         document.getElementById('subUrlInput').value = "http://" + host + panelPort + "/sub";
@@ -361,49 +481,84 @@ HTML_TEMPLATE = """
             alert('订阅链接已复制！');
         }
 
-        // 导出分享连接
-        let qrcodeInstance = null;
+        // 展示分享二维码及连接
         function showShare(user, pwd) {
             const serverIp = document.querySelector('input[name="server_ip"]').value;
-            const port = document.getElementById('portInput').value;
-            const sni = document.getElementById('serverNameInput').value;
-            const pubKey = document.getElementById('publicKeyInput').value;
-            const shortId = document.getElementById('shortIdInput').value;
+            const rEnabled = document.getElementById('realityEnabledCheckbox').checked;
+            const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
             
             const encodedPwd = encodeURIComponent(pwd);
-            const remarks = encodeURIComponent("AnyTLS+Reality-" + user);
             
-            // 按照 v2rayN / NekoBox 标准缩写格式精准拼接
-            const shareUrl = "anytls://" + encodedPwd + "@" + serverIp + ":" + port + 
-                             "?security=reality&sni=" + encodeURIComponent(sni) + 
-                             "&fp=chrome&pbk=" + encodeURIComponent(pubKey) + 
-                             "&sid=" + encodeURIComponent(shortId) + 
-                             "&type=tcp#" + remarks;
+            // 是否有 Reality 分享
+            if (rEnabled) {
+                const port = document.getElementById('realityPortInput').value;
+                const sni = document.getElementById('realitySniInput').value;
+                const pubKey = document.getElementById('publicKeyInput').value;
+                const shortId = document.getElementById('shortIdInput').value;
+                const remarks = encodeURIComponent("AnyTLS+Reality-" + user);
+                
+                const shareUrlReality = "anytls://" + encodedPwd + "@" + serverIp + ":" + port + 
+                                       "?security=reality&sni=" + encodeURIComponent(sni) + 
+                                       "&fp=chrome&pbk=" + encodeURIComponent(pubKey) + 
+                                       "&sid=" + encodeURIComponent(shortId) + 
+                                       "&type=tcp#" + remarks;
+                                       
+                document.getElementById('shareUrlReality').value = shareUrlReality;
+                document.getElementById('modalRealitySection').classList.remove('hidden');
+                
+                const qrContainer = document.getElementById('qrcodeReality');
+                qrContainer.innerHTML = "";
+                new QRCode(qrContainer, {
+                    text: shareUrlReality,
+                    width: 140,
+                    height: 140,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.L
+                });
+            } else {
+                document.getElementById('modalRealitySection').classList.add('hidden');
+            }
 
-            document.getElementById('shareUrlInput').value = shareUrl;
+            // 是否有 TLS 节点分享
+            if (tEnabled) {
+                const port = document.getElementById('tlsPortInput').value;
+                const sni = document.getElementById('tlsSniInput').value;
+                const remarks = encodeURIComponent("AnyTLS+TLS-" + user);
+                
+                const shareUrlTls = "anytls://" + encodedPwd + "@" + serverIp + ":" + port + 
+                                   "?security=tls&sni=" + encodeURIComponent(sni) + 
+                                   "&type=tcp#" + remarks;
+                                   
+                document.getElementById('shareUrlTls').value = shareUrlTls;
+                document.getElementById('modalTlsSection').classList.remove('hidden');
+                
+                const qrContainer = document.getElementById('qrcodeTls');
+                qrContainer.innerHTML = "";
+                new QRCode(qrContainer, {
+                    text: shareUrlTls,
+                    width: 140,
+                    height: 140,
+                    colorDark: "#000000",
+                    colorLight: "#ffffff",
+                    correctLevel: QRCode.CorrectLevel.L
+                });
+            } else {
+                document.getElementById('modalTlsSection').classList.add('hidden');
+            }
+
             document.getElementById('shareModal').classList.remove('hidden');
-
-            const qrContainer = document.getElementById('qrcode');
-            qrContainer.innerHTML = "";
-            qrcodeInstance = new QRCode(qrContainer, {
-                text: shareUrl,
-                width: 180,
-                height: 180,
-                colorDark: "#000000",
-                colorLight: "#ffffff",
-                correctLevel: QRCode.CorrectLevel.L
-            });
         }
 
         function closeShare() {
             document.getElementById('shareModal').classList.add('hidden');
         }
 
-        function copyShareUrl() {
-            const input = document.getElementById('shareUrlInput');
+        function copyToClipboard(elementId) {
+            const input = document.getElementById(elementId);
             input.select();
             document.execCommand('copy');
-            alert('节点链接已复制！');
+            alert('连接已成功复制！');
         }
     </script>
 </body>
@@ -483,22 +638,27 @@ def generate_short_id_route():
         return jsonify({'status': 'error', 'message': '未登录'})
     return jsonify({'short_id': secrets.token_hex(8)})
 
-# 动态订阅接口 (同样输出为 v2rayN 标准协议参数)
+# 动态订阅接口 (根据开启的服务自动汇出相应节点)
 @app.route('/sub')
 def sub_route():
     config = load_config_data()
     server_ip = get_server_ip()
-    port = config['port']
-    sni = config['server_name']
-    pub_key = config['public_key']
-    short_id = config['short_id']
     
     links = []
     for u, p in config['users']:
         encoded_pwd = urllib.parse.quote(p)
-        remarks = urllib.parse.quote(f"AnyTLS+Reality-{u}")
-        link = f"anytls://{encoded_pwd}@{server_ip}:{port}?security=reality&sni={urllib.parse.quote(sni)}&fp=chrome&pbk={urllib.parse.quote(pub_key)}&sid={urllib.parse.quote(short_id)}&type=tcp#{remarks}"
-        links.append(link)
+        
+        # 1. 汇出 Reality 节点
+        if config['reality_enabled']:
+            remarks_r = urllib.parse.quote(f"AnyTLS+Reality-{u}")
+            link_r = f"anytls://{encoded_pwd}@{server_ip}:{config['reality_port']}?security=reality&sni={urllib.parse.quote(config['reality_sni'])}&fp=chrome&pbk={urllib.parse.quote(config['public_key'])}&sid={urllib.parse.quote(config['short_id'])}&type=tcp#{remarks_r}"
+            links.append(link_r)
+            
+        # 2. 汇出 Standard TLS 节点
+        if config['tls_enabled']:
+            remarks_t = urllib.parse.quote(f"AnyTLS+TLS-{u}")
+            link_t = f"anytls://{encoded_pwd}@{server_ip}:{config['tls_port']}?security=tls&sni={urllib.parse.quote(config['tls_sni'])}&type=tcp#{remarks_t}"
+            links.append(link_t)
         
     sub_str = "\n".join(links)
     b64_sub = base64.b64encode(sub_str.encode('utf-8')).decode('utf-8')
@@ -521,23 +681,13 @@ def save_config():
         return jsonify({'status': 'error', 'message': '未登录'})
         
     try:
-        port = request.form.get('port')
         server_ip = request.form.get('server_ip')
-        server_name = request.form.get('server_name')
-        private_key = request.form.get('private_key')
-        public_key = request.form.get('public_key')
-        short_id = request.form.get('short_id')
-        padding_scheme_raw = request.form.get('padding_scheme')
+        write_file_content(IP_PATH, server_ip)
         
+        # 提取账户和混淆参数
         usernames = request.form.getlist('username[]')
         passwords = request.form.getlist('password[]')
         
-        # 1. 写入辅助文件
-        write_file_content(IP_PATH, server_ip)
-        write_file_content(PUB_KEY_PATH, public_key)
-        write_file_content(os.path.join(CONFIG_DIR, 'short_id.txt'), short_id)
-        
-        # 2. 构造并生成规范的 JSON
         users_list = []
         for u, p in zip(usernames, passwords):
             if u.strip() and p.strip():
@@ -546,37 +696,73 @@ def save_config():
                     "password": p.strip()
                 })
                 
+        padding_scheme_raw = request.form.get('padding_scheme')
         padding_scheme = [line.strip() for line in padding_scheme_raw.strip().split('\n') if line.strip()]
         
-        new_json_data = {
-            "inbounds": [
-                {
-                    "type": "anytls",
-                    "listen": "::",
-                    "listen_port": int(port),
-                    "users": users_list,
-                    "padding_scheme": padding_scheme,
-                    "tls": {
+        inbounds = []
+        
+        # 服务 1: Reality 入站
+        reality_enabled = request.form.get('reality_enabled') == 'on'
+        if reality_enabled:
+            reality_port = request.form.get('reality_port')
+            reality_sni = request.form.get('reality_sni')
+            private_key = request.form.get('private_key')
+            public_key = request.form.get('public_key')
+            short_id = request.form.get('short_id')
+            
+            write_file_content(PUB_KEY_PATH, public_key)
+            write_file_content(os.path.join(CONFIG_DIR, 'short_id.txt'), short_id)
+            
+            inbounds.append({
+                "type": "anytls",
+                "listen": "::",
+                "listen_port": int(reality_port),
+                "users": users_list,
+                "padding_scheme": padding_scheme,
+                "tls": {
+                    "enabled": True,
+                    "server_name": reality_sni,
+                    "reality": {
                         "enabled": True,
-                        "server_name": server_name,
-                        "reality": {
-                            "enabled": True,
-                            "handshake": {
-                                "server": server_name,
-                                "server_port": 443
-                            },
-                            "private_key": private_key,
-                            "short_id": short_id
-                        }
+                        "handshake": {
+                            "server": reality_sni,
+                            "server_port": 443
+                        },
+                        "private_key": private_key,
+                        "short_id": short_id
                     }
                 }
-            ]
+            })
+            
+        # 服务 2: TLS 证书入站
+        tls_enabled = request.form.get('tls_enabled') == 'on'
+        if tls_enabled:
+            tls_port = request.form.get('tls_port')
+            tls_sni = request.form.get('tls_sni')
+            cert_path = request.form.get('cert_path', '/etc/sing-box/cert.pem')
+            key_path = request.form.get('key_path', '/etc/sing-box/key.pem')
+            
+            inbounds.append({
+                "type": "anytls",
+                "listen": "::",
+                "listen_port": int(tls_port),
+                "users": users_list,
+                "padding_scheme": padding_scheme,
+                "tls": {
+                    "enabled": True,
+                    "server_name": tls_sni,
+                    "certificate_path": cert_path,
+                    "key_path": key_path
+                }
+            })
+            
+        new_json_data = {
+            "inbounds": inbounds
         }
         
         with open(CONFIG_PATH, 'w') as f:
             json.dump(new_json_data, f, indent=4)
             
-        # 3. 重启子进程
         restart_singbox_kernel()
         return jsonify({'status': 'success'})
         
