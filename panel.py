@@ -14,6 +14,10 @@ CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
 PUB_KEY_PATH = os.path.join(CONFIG_DIR, 'public_key.txt')
 PWD_PATH = os.path.join(CONFIG_DIR, 'panel_pwd.txt')
 IP_PATH = os.path.join(CONFIG_DIR, 'server_ip.txt')
+CERT_SOURCE_PATH = os.path.join(CONFIG_DIR, 'cert_source.txt')
+
+CERT_FILE = '/etc/sing-box/cert.pem'
+KEY_FILE = '/etc/sing-box/key.pem'
 
 sb_process = None
 
@@ -45,6 +49,21 @@ def get_server_ip():
         return urllib.request.urlopen('https://api.ipify.org', timeout=3).read().decode('utf-8')
     except:
         return "127.0.0.1"
+
+# 使用 OpenSSL 自动生成自签名证书
+def generate_self_signed_cert(domain, cert_path, key_path):
+    try:
+        cmd = [
+            "openssl", "req", "-x509", "-newkey", "rsa:2048", 
+            "-keyout", key_path, "-out", cert_path, 
+            "-sha256", "-days", "3650", "-nodes",
+            "-subj", f"/CN={domain}"
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return True
+    except Exception as e:
+        print("生成自签名证书失败:", e)
+        return False
 
 # 管理 Sing-box 子进程
 def restart_singbox_kernel():
@@ -78,8 +97,9 @@ def load_config_data():
         'tls_enabled': False,
         'tls_port': '8443',
         'tls_sni': 'yourdomain.com',
-        'cert_path': '/etc/sing-box/cert.pem',
-        'key_path': '/etc/sing-box/key.pem',
+        'cert_source': get_file_content(CERT_SOURCE_PATH, 'self_signed'), # 'self_signed' 或 'manual'
+        'cert_content': get_file_content(CERT_FILE),
+        'key_content': get_file_content(KEY_FILE),
     }
     
     if os.path.exists(CONFIG_PATH):
@@ -112,8 +132,6 @@ def load_config_data():
                     config['tls_enabled'] = True
                     config['tls_port'] = str(ib.get('listen_port', 8443))
                     config['tls_sni'] = tls.get('server_name', 'yourdomain.com')
-                    config['cert_path'] = tls.get('certificate_path', '/etc/sing-box/cert.pem')
-                    config['key_path'] = tls.get('key_path', '/etc/sing-box/key.pem')
                     
         except Exception as e:
             print("解析 config.json 失败:", e)
@@ -220,26 +238,47 @@ HTML_TEMPLATE = """
                             </div>
                         </div>
                         
-                        <div id="tlsFields" class="space-y-3">
+                        <div id="tlsFields" class="space-y-4">
                             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                 <div>
                                     <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (TLS Port)</label>
                                     <input type="number" name="tls_port" id="tlsPortInput" value="{{ config.tls_port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" min="1" max="65535">
                                 </div>
                                 <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">您的解析域名 (TLS SNI)</label>
-                                    <input type="text" name="tls_sni" id="tlsSniInput" value="{{ config.tls_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none">
+                                    <label class="block text-xs font-semibold text-gray-600 mb-1">证书绑定域名/伪装域名 (Domain)</label>
+                                    <input type="text" name="tls_sni" id="tlsSniInput" value="{{ config.tls_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" placeholder="例如 x.606699.xyz">
                                 </div>
                             </div>
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+
+                            <!-- 证书来源类型 -->
+                            <div class="bg-white p-3 rounded border space-y-2">
+                                <label class="block text-xs font-bold text-gray-700 mb-1">📜 证书来源类型</label>
+                                <div class="flex items-center gap-6 text-sm">
+                                    <label class="flex items-center gap-1.5 cursor-pointer">
+                                        <input type="radio" name="cert_source" value="self_signed" onchange="toggleCertSource()" {% if config.cert_source == 'self_signed' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
+                                        自动生成自签名证书 (基于上方域名)
+                                    </label>
+                                    <label class="flex items-center gap-1.5 cursor-pointer">
+                                        <input type="radio" name="cert_source" value="manual" onchange="toggleCertSource()" {% if config.cert_source == 'manual' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
+                                        手动贴入真实域名证书 (CA签发)
+                                    </label>
+                                </div>
+                            </div>
+
+                            <!-- 手动贴入的文本框 -->
+                            <div id="manualCertFields" class="space-y-3 hidden">
                                 <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">证书文件路径 (certificate_path - 必须为 fullchain)</label>
-                                    <input type="text" name="cert_path" id="certPathInput" value="{{ config.cert_path }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none">
+                                    <label class="block text-[11px] font-semibold text-gray-500 mb-1">公钥 PEM 内容 (cert.pem / fullchain.cer)</label>
+                                    <textarea name="cert_content" rows="5" class="w-full border rounded p-2 font-mono text-xs outline-none bg-white" placeholder="-----BEGIN CERTIFICATE-----&#10;...公钥内容...&#10;-----END CERTIFICATE-----">{{ config.cert_content }}</textarea>
                                 </div>
                                 <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">私钥文件路径 (key_path - 私钥文件)</label>
-                                    <input type="text" name="key_path" id="keyPathInput" value="{{ config.key_path }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none">
+                                    <label class="block text-[11px] font-semibold text-gray-500 mb-1">私钥 PEM 内容 (key.pem / private.key)</label>
+                                    <textarea name="key_content" rows="5" class="w-full border rounded p-2 font-mono text-xs outline-none bg-white" placeholder="-----BEGIN PRIVATE KEY-----&#10;...私钥内容...&#10;-----END PRIVATE KEY-----">{{ config.key_content }}</textarea>
                                 </div>
+                            </div>
+                            
+                            <div id="selfSignedNote" class="text-xs text-indigo-600 bg-indigo-50 p-2.5 rounded border border-indigo-100 hidden">
+                                💡 <b>提示</b>：选择“自动生成”后，保存时后台会自动调用系统 OpenSSL 生成一个 10 年期的自签名证书，节点会自动附带 <code>allowInsecure=1</code> 参数以便客户端成功连接。
                             </div>
                         </div>
                     </div>
@@ -354,12 +393,33 @@ HTML_TEMPLATE = """
             
             if (tEnabled) {
                 tFields.classList.remove('opacity-50');
-                tFields.querySelectorAll('input').forEach(el => el.disabled = false);
+                tFields.querySelectorAll('input, select, radio').forEach(el => el.disabled = false);
+                toggleCertSource(); // 重新加载证书输入框的状态
             } else {
                 tFields.classList.add('opacity-50');
-                tFields.querySelectorAll('input').forEach(el => {
+                tFields.querySelectorAll('input, select, textarea, radio').forEach(el => {
                     if (el.id !== 'tlsEnabledCheckbox') el.disabled = true;
                 });
+            }
+        }
+
+        // 切换自签名与手动粘贴的显示状态
+        function toggleCertSource() {
+            const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
+            if (!tEnabled) return;
+
+            const source = document.querySelector('input[name="cert_source"]:checked').value;
+            const manualFields = document.getElementById('manualCertFields');
+            const selfSignedNote = document.getElementById('selfSignedNote');
+
+            if (source === 'manual') {
+                manualFields.classList.remove('hidden');
+                manualFields.querySelectorAll('textarea').forEach(el => el.disabled = false);
+                selfSignedNote.classList.add('hidden');
+            } else {
+                manualFields.classList.add('hidden');
+                manualFields.querySelectorAll('textarea').forEach(el => el.disabled = true);
+                selfSignedNote.classList.remove('hidden');
             }
         }
 
@@ -524,11 +584,18 @@ HTML_TEMPLATE = """
             if (tEnabled) {
                 const port = document.getElementById('tlsPortInput').value;
                 const sni = document.getElementById('tlsSniInput').value;
+                const certSource = document.querySelector('input[name="cert_source"]:checked').value;
                 const remarks = encodeURIComponent("AnyTLS+TLS-" + user);
+                
+                // 如果是自签名证书，附加 allowInsecure=1 保证客户端可以直接连通
+                let insecureParam = "";
+                if (certSource === 'self_signed') {
+                    insecureParam = "&allowInsecure=1";
+                }
                 
                 const shareUrlTls = "anytls://" + encodedPwd + "@" + serverIp + ":" + port + 
                                    "?security=tls&sni=" + encodeURIComponent(sni) + 
-                                   "&type=tcp#" + remarks;
+                                   insecureParam + "&type=tcp#" + remarks;
                                    
                 document.getElementById('shareUrlTls').value = shareUrlTls;
                 document.getElementById('modalTlsSection').classList.remove('hidden');
@@ -657,7 +724,12 @@ def sub_route():
         # 2. 汇出 Standard TLS 节点
         if config['tls_enabled']:
             remarks_t = urllib.parse.quote(f"AnyTLS+TLS-{u}")
-            link_t = f"anytls://{encoded_pwd}@{server_ip}:{config['tls_port']}?security=tls&sni={urllib.parse.quote(config['tls_sni'])}&type=tcp#{remarks_t}"
+            
+            insecure_param = ""
+            if config['cert_source'] == 'self_signed':
+                insecure_param = "&allowInsecure=1"
+                
+            link_t = f"anytls://{encoded_pwd}@{server_ip}:{config['tls_port']}?security=tls&sni={urllib.parse.quote(config['tls_sni'])}&type=tcp{insecure_param}#{remarks_t}"
             links.append(link_t)
         
     sub_str = "\n".join(links)
@@ -739,8 +811,21 @@ def save_config():
         if tls_enabled:
             tls_port = request.form.get('tls_port')
             tls_sni = request.form.get('tls_sni')
-            cert_path = request.form.get('cert_path', '/etc/sing-box/cert.pem')
-            key_path = request.form.get('key_path', '/etc/sing-box/key.pem')
+            cert_source = request.form.get('cert_source', 'self_signed')
+            
+            write_file_content(CERT_SOURCE_PATH, cert_source)
+            
+            if cert_source == 'self_signed':
+                # 自动生成自签名证书
+                success = generate_self_signed_cert(tls_sni, CERT_FILE, KEY_FILE)
+                if not success:
+                    return jsonify({'status': 'error', 'message': '自签名证书生成失败，请确认系统已正确安装 OpenSSL！'})
+            else:
+                # 写入用户手动粘贴的证书内容
+                cert_content = request.form.get('cert_content', '')
+                key_content = request.form.get('key_content', '')
+                write_file_content(CERT_FILE, cert_content)
+                write_file_content(KEY_FILE, key_content)
             
             inbounds.append({
                 "type": "anytls",
@@ -751,8 +836,8 @@ def save_config():
                 "tls": {
                     "enabled": True,
                     "server_name": tls_sni,
-                    "certificate_path": cert_path,
-                    "key_path": key_path
+                    "certificate_path": CERT_FILE,
+                    "key_path": KEY_FILE
                 }
             })
             
