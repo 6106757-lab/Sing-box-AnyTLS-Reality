@@ -4,6 +4,7 @@ import secrets
 import base64
 import urllib.parse
 import subprocess
+import socket
 from flask import Flask, request, render_template_string, redirect, session, jsonify
 
 app = Flask(__name__)
@@ -15,6 +16,7 @@ PUB_KEY_PATH = os.path.join(CONFIG_DIR, 'public_key.txt')
 PWD_PATH = os.path.join(CONFIG_DIR, 'panel_pwd.txt')
 IP_PATH = os.path.join(CONFIG_DIR, 'server_ip.txt')
 CERT_SOURCE_PATH = os.path.join(CONFIG_DIR, 'cert_source.txt')
+SUB_TOKEN_PATH = os.path.join(CONFIG_DIR, 'sub_token.txt')
 
 CERT_FILE = '/etc/sing-box/cert.pem'
 KEY_FILE = '/etc/sing-box/key.pem'
@@ -50,6 +52,24 @@ def get_server_ip():
     except:
         return "127.0.0.1"
 
+def get_sub_token():
+    token = get_file_content(SUB_TOKEN_PATH)
+    if not token:
+        token = secrets.token_hex(16)
+        write_file_content(SUB_TOKEN_PATH, token)
+    return token
+
+# 检测特定端口是否被宿主机其他进程占用
+def is_port_occupied(port):
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.4)
+            # 尝试绑定端口，如果成功绑定说明该端口此时未被占用
+            s.bind(('0.0.0.0', int(port)))
+        return False
+    except:
+        return True
+
 # 使用 OpenSSL 自动生成自签名证书
 def generate_self_signed_cert(domain, cert_path, key_path):
     try:
@@ -84,6 +104,7 @@ def load_config_data():
         'users': [('admin', 'adminpassword')],
         'padding_scheme': "stop=3\n0=30-30\n1=100-400\n2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
         'server_ip': get_server_ip(),
+        'sub_token': get_sub_token(),
         
         # Reality 默认参数
         'reality_enabled': False,
@@ -97,7 +118,7 @@ def load_config_data():
         'tls_enabled': False,
         'tls_port': '8443',
         'tls_sni': 'yourdomain.com',
-        'cert_source': get_file_content(CERT_SOURCE_PATH, 'self_signed'), # 'self_signed' 或 'manual'
+        'cert_source': get_file_content(CERT_SOURCE_PATH, 'self_signed'),
         'cert_content': get_file_content(CERT_FILE),
         'key_content': get_file_content(KEY_FILE),
     }
@@ -108,7 +129,6 @@ def load_config_data():
                 data = json.load(f)
             inbounds = data.get('inbounds', [])
             
-            # 解析共享数据（从第一个可用的 inbound 获取账号和混淆策略）
             if inbounds:
                 first_ib = inbounds[0]
                 users_list = []
@@ -118,7 +138,6 @@ def load_config_data():
                     config['users'] = users_list
                 config['padding_scheme'] = '\n'.join(first_ib.get('padding_scheme', []))
             
-            # 遍历解析具体的安全服务模式
             for ib in inbounds:
                 tls = ib.get('tls', {})
                 reality = tls.get('reality', {})
@@ -142,238 +161,318 @@ HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Sing-box AnyTLS 融合版双服务面板</title>
+    <title>Sing-box AnyTLS 融合版面板</title>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { font-family: 'Inter', sans-serif; }
+    </style>
 </head>
-<body class="bg-gray-50 text-gray-800 min-h-screen">
-    <div class="container mx-auto max-w-4xl py-8 px-4">
-        <div class="bg-white rounded-xl shadow-lg overflow-hidden p-6 md:p-8">
-            <!-- 导航 -->
-            <div class="flex justify-between items-center border-b pb-4 mb-6">
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+    <div class="container mx-auto max-w-4xl py-10 px-4 md:px-6">
+        
+        <!-- 头部 Card -->
+        <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 mb-6">
+            <div class="flex flex-col md:flex-row md:items-center justify-between gap-4">
                 <div>
-                    <h1 class="text-2xl font-bold text-indigo-600">Sing-box AnyTLS 融合版面板</h1>
-                    <p class="text-xs text-gray-400 mt-1">支持 AnyTLS + Reality 与 AnyTLS + TLS 证书服务同时独立运行</p>
+                    <h1 class="text-2xl font-bold tracking-tight text-slate-900">AnyTLS 融合控制台</h1>
+                    <p class="text-sm text-slate-500 mt-1">集成一键 Reality 密钥对生成、Standard TLS自签名证书及高安全动态订阅</p>
                 </div>
+                <div class="flex items-center gap-3">
+                    <!-- 运行状态探针 -->
+                    <div class="flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border" id="statusBadge">
+                        <span class="w-2.5 h-2.5 rounded-full" id="statusDot"></span>
+                        <span id="statusText">正在检测状态...</span>
+                    </div>
+                    <a href="/logout" class="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 py-2 rounded-lg font-semibold transition">安全退出</a>
+                </div>
+            </div>
+        </div>
+
+        <!-- 导航选项卡 -->
+        <div class="flex gap-2 mb-6 bg-slate-200/60 p-1 rounded-xl max-w-xs">
+            <button onclick="switchTab('config-tab', this)" class="tab-btn flex-1 text-sm font-medium py-2 rounded-lg text-indigo-700 bg-white shadow-sm transition">系统配置</button>
+            <button onclick="switchTab('security-tab', this)" class="tab-btn flex-1 text-sm font-medium py-2 rounded-lg text-slate-600 hover:text-slate-900 transition">面板安全</button>
+        </div>
+
+        <!-- TAB 1: 系统配置 -->
+        <div id="config-tab" class="tab-content space-y-6">
+            
+            <!-- 订阅管理 Card -->
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+                    <div class="flex items-center gap-2">
+                        <span class="text-xl">🔒</span>
+                        <h3 class="font-semibold text-slate-900">安全订阅分发中心</h3>
+                    </div>
+                    <span class="text-[10px] bg-emerald-50 text-emerald-700 font-bold px-2 py-0.5 rounded border border-emerald-100">已启用 Dynamic-Token 防扫</span>
+                </div>
+                <p class="text-xs text-slate-500">外部扫描器无法通过通用路径探测您的配置。如需分享或导入节点，请一键复制以下高强度安全订阅链接：</p>
                 <div class="flex gap-2">
-                    <button onclick="openTab('config-tab')" class="text-sm bg-indigo-50 text-indigo-700 px-4 py-2 rounded font-semibold">系统配置</button>
-                    <button onclick="openTab('security-tab')" class="text-sm bg-gray-100 text-gray-700 px-4 py-2 rounded font-semibold">安全设置</button>
-                    <a href="/logout" class="text-sm bg-red-100 text-red-700 px-4 py-2 rounded font-semibold">退出</a>
+                    <input type="text" id="subUrlInput" readonly class="flex-1 bg-slate-50 border border-slate-200 rounded-xl px-4 py-2 text-xs text-slate-600 font-mono outline-none">
+                    <button type="button" onclick="copySubUrl()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-semibold px-5 rounded-xl transition shadow-sm">复制订阅</button>
                 </div>
             </div>
 
-            <!-- TAB 1: 系统配置 -->
-            <div id="config-tab" class="tab-content space-y-6">
-                <!-- 动态订阅 -->
-                <div class="bg-indigo-50 border border-indigo-200 rounded-lg p-4">
-                    <h3 class="text-sm font-bold text-indigo-800 mb-1">🔗 我的动态订阅链接</h3>
-                    <p class="text-xs text-indigo-600 mb-2">一键复制此链接。订阅将自动输出当前所有开启状态的服务节点：</p>
-                    <div class="flex gap-2">
-                        <input type="text" id="subUrlInput" readonly class="flex-1 bg-white border border-indigo-300 rounded px-3 py-1.5 text-xs text-gray-600 outline-none">
-                        <button type="button" onclick="copySubUrl()" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold px-4 rounded shadow">复制订阅</button>
+            <form id="configForm" class="space-y-6">
+                <!-- 公共网络配置 -->
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                    <h3 class="font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">🌐 公共核心参数</h3>
+                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-500 mb-1.5">服务器公网 IP (用于节点导出)</label>
+                            <input type="text" name="server_ip" value="{{ config.server_ip }}" class="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                        </div>
+                        <div>
+                            <label class="block text-xs font-semibold text-slate-500 mb-1.5">自定义订阅安全 Token / 专属路径</label>
+                            <div class="flex gap-2">
+                                <input type="text" name="sub_token" id="subTokenInput" value="{{ config.sub_token }}" oninput="updateSubUrlDisplay(this.value)" class="flex-1 border border-slate-200 rounded-xl px-4 py-2 text-xs font-mono outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                                <button type="button" onclick="randomizeSubToken()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 rounded-xl text-xs font-semibold transition">随机</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
-                <form id="configForm" class="space-y-6">
-                    <!-- 基本网络配置 -->
-                    <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <h3 class="text-sm font-bold text-gray-700 border-b pb-1">🌐 核心公共参数</h3>
+                <!-- 模式一: Reality -->
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                    <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+                        <div class="flex items-center gap-2.5">
+                            <input type="checkbox" name="reality_enabled" id="realityEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500" {% if config.reality_enabled %}checked{% endif %}>
+                            <label for="realityEnabledCheckbox" class="font-semibold text-slate-900 cursor-pointer">服务一: AnyTLS + Reality 模式</label>
+                        </div>
+                        <button type="button" id="genKeyBtn" onclick="generateNewKeys()" class="text-xs bg-slate-50 hover:bg-slate-100 text-indigo-600 px-3 py-1.5 rounded-lg border border-slate-200 font-medium transition">
+                            🔄 重新生成 Reality 密钥对
+                        </button>
+                    </div>
+                    
+                    <div id="realityFields" class="space-y-4">
                         <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                             <div>
-                                <label class="block text-xs font-semibold text-gray-600 mb-1">服务器 IP (用于节点导出)</label>
-                                <input type="text" name="server_ip" value="{{ config.server_ip }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" required>
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- 服务 1: Reality -->
-                    <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <div class="flex items-center justify-between border-b pb-1">
-                            <div class="flex items-center gap-2">
-                                <input type="checkbox" name="reality_enabled" id="realityEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" {% if config.reality_enabled %}checked{% endif %}>
-                                <label for="realityEnabledCheckbox" class="text-sm font-bold text-gray-700 cursor-pointer">服务一: AnyTLS + Reality 模式</label>
-                            </div>
-                            <button type="button" onclick="generateNewKeys()" class="text-[11px] bg-indigo-50 hover:bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded border border-indigo-100">
-                                🔄 重新生成 Reality 密钥对
-                            </button>
-                        </div>
-                        
-                        <div id="realityFields" class="space-y-3">
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (Reality Port)</label>
-                                    <input type="number" name="reality_port" id="realityPortInput" value="{{ config.reality_port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" min="1" max="65535">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">目标伪装域名 (Reality SNI)</label>
-                                    <input type="text" name="reality_sni" id="realitySniInput" value="{{ config.reality_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none">
-                                </div>
+                                <label class="block text-xs font-semibold text-slate-500 mb-1.5">监听端口 (Reality Port)</label>
+                                <input type="number" name="reality_port" id="realityPortInput" value="{{ config.reality_port }}" class="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" min="1" max="65535">
                             </div>
                             <div>
-                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">服务端私钥 (private_key - 绝对保密)</label>
-                                <input type="text" name="private_key" id="privateKeyInput" value="{{ config.private_key }}" class="w-full border rounded px-3 py-1.5 text-xs font-mono outline-none" readonly>
-                            </div>
-                            <div>
-                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">客户端公钥 (public_key - 客户端链接需要)</label>
-                                <input type="text" name="public_key" id="publicKeyInput" value="{{ config.public_key }}" class="w-full border bg-white rounded px-3 py-1.5 text-xs font-mono outline-none" readonly>
-                            </div>
-                            <div>
-                                <label class="block text-[11px] font-semibold text-gray-500 mb-1">短期握手标识 ID (short_id)</label>
-                                <div class="flex gap-2">
-                                    <input type="text" name="short_id" id="shortIdInput" value="{{ config.short_id }}" class="flex-1 border rounded px-3 py-1.5 text-xs font-mono outline-none">
-                                    <button type="button" onclick="generateNewShortId()" class="bg-gray-200 hover:bg-gray-300 text-gray-700 px-3 py-1 rounded text-xs">随机</button>
-                                </div>
+                                <label class="block text-xs font-semibold text-slate-500 mb-1.5">目标伪装域名 (Reality SNI)</label>
+                                <input type="text" name="reality_sni" id="realitySniInput" value="{{ config.reality_sni }}" class="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
                             </div>
                         </div>
-                    </div>
-
-                    <!-- 服务 2: Standard TLS -->
-                    <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <div class="flex items-center justify-between border-b pb-1">
-                            <div class="flex items-center gap-2">
-                                <input type="checkbox" name="tls_enabled" id="tlsEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-gray-300 rounded focus:ring-indigo-500" {% if config.tls_enabled %}checked{% endif %}>
-                                <label for="tlsEnabledCheckbox" class="text-sm font-bold text-gray-700 cursor-pointer">服务二: AnyTLS + Standard TLS 证书模式</label>
-                            </div>
-                        </div>
-                        
-                        <div id="tlsFields" class="space-y-4">
-                            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                                <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">监听端口 (TLS Port)</label>
-                                    <input type="number" name="tls_port" id="tlsPortInput" value="{{ config.tls_port }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" min="1" max="65535">
-                                </div>
-                                <div>
-                                    <label class="block text-xs font-semibold text-gray-600 mb-1">证书绑定域名/伪装域名 (Domain)</label>
-                                    <input type="text" name="tls_sni" id="tlsSniInput" value="{{ config.tls_sni }}" class="w-full border rounded px-3 py-1.5 text-sm outline-none" placeholder="例如 x.606699.xyz">
-                                </div>
-                            </div>
-
-                            <!-- 证书来源类型 -->
-                            <div class="bg-white p-3 rounded border space-y-2">
-                                <label class="block text-xs font-bold text-gray-700 mb-1">📜 证书来源类型</label>
-                                <div class="flex items-center gap-6 text-sm">
-                                    <label class="flex items-center gap-1.5 cursor-pointer">
-                                        <input type="radio" name="cert_source" value="self_signed" onchange="toggleCertSource()" {% if config.cert_source == 'self_signed' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
-                                        自动生成自签名证书 (基于上方域名)
-                                    </label>
-                                    <label class="flex items-center gap-1.5 cursor-pointer">
-                                        <input type="radio" name="cert_source" value="manual" onchange="toggleCertSource()" {% if config.cert_source == 'manual' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
-                                        手动贴入真实域名证书 (CA签发)
-                                    </label>
-                                </div>
-                            </div>
-
-                            <!-- 手动贴入的文本框 -->
-                            <div id="manualCertFields" class="space-y-3 hidden">
-                                <div>
-                                    <label class="block text-[11px] font-semibold text-gray-500 mb-1">公钥 PEM 内容 (cert.pem / fullchain.cer)</label>
-                                    <textarea name="cert_content" rows="5" class="w-full border rounded p-2 font-mono text-xs outline-none bg-white" placeholder="-----BEGIN CERTIFICATE-----&#10;...公钥内容...&#10;-----END CERTIFICATE-----">{{ config.cert_content }}</textarea>
-                                </div>
-                                <div>
-                                    <label class="block text-[11px] font-semibold text-gray-500 mb-1">私钥 PEM 内容 (key.pem / private.key)</label>
-                                    <textarea name="key_content" rows="5" class="w-full border rounded p-2 font-mono text-xs outline-none bg-white" placeholder="-----BEGIN PRIVATE KEY-----&#10;...私钥内容...&#10;-----END PRIVATE KEY-----">{{ config.key_content }}</textarea>
-                                </div>
-                            </div>
-                            
-                            <div id="selfSignedNote" class="text-xs text-indigo-600 bg-indigo-50 p-2.5 rounded border border-indigo-100 hidden">
-                                💡 <b>提示</b>：选择“自动生成”后，保存时后台会自动调用系统 OpenSSL 生成一个 10 年期的自签名证书，节点会自动附带 <code>allowInsecure=1</code> 参数以便客户端成功连接。
-                            </div>
-                        </div>
-                    </div>
-
-                    <!-- 账号管理 -->
-                    <div class="bg-gray-50 p-4 rounded-lg border space-y-4">
-                        <h3 class="text-sm font-bold text-gray-700 border-b pb-1">👥 用户管理与一键分享</h3>
-                        <div id="usersContainer" class="space-y-2">
-                            {% for user, pwd in config.users %}
-                            <div class="flex gap-2 user-row items-center">
-                                <input type="text" name="username[]" value="{{ user }}" placeholder="用户名" class="flex-1 border rounded px-3 py-1.5 text-sm outline-none" required>
-                                <input type="text" name="password[]" value="{{ pwd }}" placeholder="密码" class="flex-1 border rounded px-3 py-1.5 text-sm outline-none" required>
-                                <button type="button" onclick="showShare('{{ user }}', '{{ pwd }}')" class="bg-green-500 hover:bg-green-600 text-white px-4 py-1.5 rounded text-xs font-bold shadow">生成连接</button>
-                                <button type="button" onclick="removeUserRow(this)" class="bg-red-500 hover:bg-red-600 text-white px-4 py-1.5 rounded text-xs">删除</button>
-                            </div>
-                            {% endfor %}
-                        </div>
-                        <button type="button" onclick="addUserRow()" class="text-xs bg-indigo-50 hover:bg-indigo-100 text-indigo-600 font-semibold px-4 py-2 rounded border border-indigo-100">
-                            + 添加新用户
-                        </button>
-                    </div>
-
-                    <!-- Padding-Scheme -->
-                    <div class="bg-gray-50 p-4 rounded-lg border space-y-2">
-                        <h3 class="text-sm font-bold text-gray-700 border-b pb-1">📉 自定义混淆策略 (Padding-Scheme)</h3>
-                        <textarea name="padding_scheme" id="paddingInput" rows="4" class="w-full border rounded p-2 font-mono text-sm outline-none bg-white" required>{{ config.padding_scheme }}</textarea>
-                    </div>
-
-                    <div class="pt-4 border-t flex items-center justify-between">
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-8 py-3 rounded shadow">
-                            保存并重启内核
-                        </button>
-                        <span id="statusMsg" class="text-sm font-semibold"></span>
-                    </div>
-                </form>
-            </div>
-
-            <!-- TAB 2: 安全设置 -->
-            <div id="security-tab" class="tab-content hidden space-y-6">
-                <div class="bg-gray-50 rounded-lg p-6 border">
-                    <h3 class="text-lg font-bold text-gray-800 mb-4">🔑 修改面板登录密码</h3>
-                    <form id="pwdForm" class="space-y-4">
                         <div>
-                            <label class="block text-sm text-gray-600 mb-1">输入新密码</label>
-                            <input type="password" name="new_password" class="w-full md:w-1/2 border rounded px-3 py-2 outline-none" required minlength="4">
+                            <label class="block text-[11px] font-semibold text-slate-400 mb-1">服务端私钥 (private_key - 绝对保密)</label>
+                            <input type="text" name="private_key" id="privateKeyInput" value="{{ config.private_key }}" class="w-full border border-slate-200 rounded-xl px-4 py-2 text-xs font-mono outline-none bg-slate-50 text-slate-500" readonly>
                         </div>
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-6 py-2 rounded">确认保存</button>
-                        <span id="pwdStatus" class="text-sm font-semibold block mt-2"></span>
-                    </form>
+                        <div>
+                            <label class="block text-[11px] font-semibold text-slate-400 mb-1">客户端公钥 (public_key - 客户端链接需要)</label>
+                            <input type="text" name="public_key" id="publicKeyInput" value="{{ config.public_key }}" class="w-full border border-slate-200 rounded-xl px-4 py-2 text-xs font-mono outline-none bg-slate-50 text-slate-500" readonly>
+                        </div>
+                        <div>
+                            <label class="block text-[11px] font-semibold text-slate-400 mb-1">短期握手标识 ID (short_id)</label>
+                            <div class="flex gap-2">
+                                <input type="text" name="short_id" id="shortIdInput" value="{{ config.short_id }}" class="flex-1 border border-slate-200 rounded-xl px-4 py-2 text-xs font-mono outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition">
+                                <button type="button" onclick="generateNewShortId()" class="bg-slate-100 hover:bg-slate-200 text-slate-700 px-4 rounded-xl text-xs font-semibold transition">随机</button>
+                            </div>
+                        </div>
+                    </div>
                 </div>
+
+                <!-- 模式二: Standard TLS -->
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                    <div class="flex items-center justify-between border-b border-slate-100 pb-3">
+                        <div class="flex items-center gap-2.5">
+                            <input type="checkbox" name="tls_enabled" id="tlsEnabledCheckbox" onchange="toggleServiceBlocks()" class="w-4 h-4 text-indigo-600 border-slate-300 rounded focus:ring-indigo-500" {% if config.tls_enabled %}checked{% endif %}>
+                            <label for="tlsEnabledCheckbox" class="font-semibold text-slate-900 cursor-pointer">服务二: AnyTLS + Standard TLS 证书模式</label>
+                        </div>
+                    </div>
+                    
+                    <div id="tlsFields" class="space-y-4">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label class="block text-xs font-semibold text-slate-500 mb-1.5">监听端口 (TLS Port)</label>
+                                <input type="number" name="tls_port" id="tlsPortInput" value="{{ config.tls_port }}" class="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" min="1" max="65535">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-semibold text-slate-500 mb-1.5">证书绑定域名/伪装域名 (Domain)</label>
+                                <input type="text" name="tls_sni" id="tlsSniInput" value="{{ config.tls_sni }}" class="w-full border border-slate-200 rounded-xl px-4 py-2.5 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" placeholder="例如 x.606699.xyz">
+                            </div>
+                        </div>
+
+                        <!-- 证书来源选择 -->
+                        <div class="bg-slate-50/50 p-4 rounded-xl border border-slate-100 space-y-2.5">
+                            <label class="block text-xs font-bold text-slate-700">📜 证书来源管理</label>
+                            <div class="flex flex-col sm:flex-row gap-4 text-sm text-slate-600">
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="radio" name="cert_source" value="self_signed" onchange="toggleCertSource()" {% if config.cert_source == 'self_signed' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
+                                    自动生成自签名证书 (基于上方绑定域名)
+                                </label>
+                                <label class="flex items-center gap-2 cursor-pointer">
+                                    <input type="radio" name="cert_source" value="manual" onchange="toggleCertSource()" {% if config.cert_source == 'manual' %}checked{% endif %} class="w-4 h-4 text-indigo-600">
+                                    手动贴入真实域名证书 (CA 签发)
+                                </label>
+                            </div>
+                        </div>
+
+                        <div id="manualCertFields" class="space-y-3 hidden">
+                            <div>
+                                <label class="block text-[11px] font-semibold text-slate-400 mb-1">公钥 PEM 内容 (cert.pem / fullchain.cer)</label>
+                                <textarea name="cert_content" rows="4" class="w-full border border-slate-200 rounded-xl p-3 font-mono text-xs outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" placeholder="-----BEGIN CERTIFICATE-----&#10;...公钥内容...&#10;-----END CERTIFICATE-----">{{ config.cert_content }}</textarea>
+                            </div>
+                            <div>
+                                <label class="block text-[11px] font-semibold text-slate-400 mb-1">私钥 PEM 内容 (key.pem / private.key)</label>
+                                <textarea name="key_content" rows="4" class="w-full border border-slate-200 rounded-xl p-3 font-mono text-xs outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" placeholder="-----BEGIN PRIVATE KEY-----&#10;...私钥内容...&#10;-----END PRIVATE KEY-----">{{ config.key_content }}</textarea>
+                            </div>
+                        </div>
+                        
+                        <div id="selfSignedNote" class="text-xs text-indigo-700 bg-indigo-50/50 p-3 rounded-xl border border-indigo-100/50 leading-relaxed hidden">
+                            💡 <b>提示</b>：系统在保存时将自动调用 OpenSSL 签发一个 10 年期的自签名证书。导出的链接会自动追加 <code>allowInsecure=1</code> 安全参数，以便客户端成功连通。
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 账号管理 -->
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                    <h3 class="font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center justify-between">
+                        <span>👥 用户配置与一键提取</span>
+                        <button type="button" onclick="addUserRow()" class="text-xs text-indigo-600 hover:text-indigo-700 font-semibold transition">+ 新增账户</button>
+                    </h3>
+                    <div id="usersContainer" class="space-y-3">
+                        {% for user, pwd in config.users %}
+                        <div class="flex flex-col sm:flex-row gap-2 user-row items-center bg-slate-50/50 p-3 rounded-xl border border-slate-100">
+                            <input type="text" name="username[]" value="{{ user }}" placeholder="用户名" class="w-full sm:flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                            <input type="text" name="password[]" value="{{ pwd }}" placeholder="密码" class="w-full sm:flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                            <div class="flex gap-2 w-full sm:w-auto mt-2 sm:mt-0">
+                                <button type="button" onclick="showShare('{{ user }}', '{{ pwd }}')" class="flex-1 sm:flex-none bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-1.5 rounded-lg text-xs font-semibold transition shadow-sm">提取节点</button>
+                                <button type="button" onclick="removeUserRow(this)" class="bg-rose-500 hover:bg-rose-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition">删除</button>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                </div>
+
+                <!-- Padding-Scheme -->
+                <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-3">
+                    <h3 class="font-semibold text-slate-900 border-b border-slate-100 pb-3 flex items-center gap-2">📉 自定义混淆策略 (Padding-Scheme)</h3>
+                    <textarea name="padding_scheme" id="paddingInput" rows="3" class="w-full border border-slate-200 rounded-xl p-3 font-mono text-xs outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>{{ config.padding_scheme }}</textarea>
+                </div>
+
+                <!-- 保存提交 -->
+                <div class="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-4">
+                    <button type="submit" class="w-full sm:w-auto bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-10 py-3.5 rounded-xl transition shadow-md hover:shadow-lg">
+                        保存并重启内核
+                    </button>
+                    <span id="statusMsg" class="text-sm font-semibold"></span>
+                </div>
+            </form>
+        </div>
+
+        <!-- TAB 2: 安全设置 -->
+        <div id="security-tab" class="tab-content hidden space-y-6">
+            <div class="bg-white rounded-2xl shadow-sm border border-slate-100 p-6 space-y-4">
+                <h3 class="text-lg font-bold text-slate-900 border-b border-slate-100 pb-3">🔑 修改面板管理密码</h3>
+                <form id="pwdForm" class="space-y-4">
+                    <div>
+                        <label class="block text-xs font-semibold text-slate-500 mb-1.5">输入新密码</label>
+                        <input type="password" name="new_password" class="w-full md:w-1/2 border border-slate-200 rounded-xl px-4 py-2.5 outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required minlength="4">
+                    </div>
+                    <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white font-semibold px-6 py-2.5 rounded-xl transition shadow-sm">确认保存</button>
+                    <span id="pwdStatus" class="text-sm font-semibold block mt-1"></span>
+                </form>
             </div>
         </div>
     </div>
 
     <!-- 二维码与一键导入弹窗 -->
-    <div id="shareModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center hidden p-4 z-50">
-        <div class="bg-white rounded-xl shadow-lg max-w-lg w-full p-6 space-y-4 overflow-y-auto max-h-[90vh]">
-            <div class="flex justify-between items-center border-b pb-2">
-                <h3 class="font-bold text-gray-800 text-lg">节点一键导入</h3>
-                <button onclick="closeShare()" class="text-gray-400 hover:text-gray-600 text-xl font-bold">&times;</button>
+    <div id="shareModal" class="fixed inset-0 bg-slate-900/60 backdrop-blur-sm flex items-center justify-center hidden p-4 z-50">
+        <div class="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 overflow-y-auto max-h-[90vh]">
+            <div class="flex justify-between items-center border-b border-slate-100 pb-3">
+                <h3 class="font-bold text-slate-900 text-lg">节点一键导入</h3>
+                <button onclick="closeShare()" class="text-slate-400 hover:text-slate-600 text-2xl font-semibold leading-none">&times;</button>
             </div>
             
             <!-- Reality 节点分享区 -->
-            <div id="modalRealitySection" class="hidden space-y-2 border-b pb-4">
+            <div id="modalRealitySection" class="hidden space-y-3 border-b border-slate-100 pb-4">
                 <h4 class="font-bold text-sm text-indigo-700">🟢 AnyTLS + Reality 节点</h4>
-                <div class="flex gap-1">
-                    <input type="text" id="shareUrlReality" readonly class="flex-1 border bg-gray-50 rounded px-2 py-1 text-xs outline-none">
-                    <button onclick="copyToClipboard('shareUrlReality')" class="bg-indigo-600 text-white text-xs px-3 py-1 rounded">复制</button>
+                <div class="flex gap-2">
+                    <input type="text" id="shareUrlReality" readonly class="flex-1 border border-slate-200 bg-slate-50 rounded-xl px-3 py-1.5 text-xs outline-none">
+                    <button onclick="copyToClipboard('shareUrlReality')" class="bg-indigo-600 text-white text-xs px-4 rounded-xl">复制</button>
                 </div>
-                <div class="flex flex-col items-center justify-center p-2 bg-gray-50 rounded">
-                    <div id="qrcodeReality" class="border p-1 bg-white rounded"></div>
+                <div class="flex flex-col items-center justify-center p-3 bg-slate-50 rounded-xl">
+                    <div id="qrcodeReality" class="border p-2 bg-white rounded-lg shadow-sm"></div>
                 </div>
             </div>
 
             <!-- Standard TLS 节点分享区 -->
-            <div id="modalTlsSection" class="hidden space-y-2">
-                <h4 class="font-bold text-sm text-green-700">🟢 AnyTLS + Standard TLS 证书节点</h4>
-                <div class="flex gap-1">
-                    <input type="text" id="shareUrlTls" readonly class="flex-1 border bg-gray-50 rounded px-2 py-1 text-xs outline-none">
-                    <button onclick="copyToClipboard('shareUrlTls')" class="bg-green-600 text-white text-xs px-3 py-1 rounded">复制</button>
+            <div id="modalTlsSection" class="hidden space-y-3">
+                <h4 class="font-bold text-sm text-emerald-700">🟢 AnyTLS + Standard TLS 证书节点</h4>
+                <div class="flex gap-2">
+                    <input type="text" id="shareUrlTls" readonly class="flex-1 border border-slate-200 bg-slate-50 rounded-xl px-3 py-1.5 text-xs outline-none">
+                    <button onclick="copyToClipboard('shareUrlTls')" class="bg-emerald-600 text-white text-xs px-4 rounded-xl">复制</button>
                 </div>
-                <div class="flex flex-col items-center justify-center p-2 bg-gray-50 rounded">
-                    <div id="qrcodeTls" class="border p-1 bg-white rounded"></div>
+                <div class="flex flex-col items-center justify-center p-3 bg-slate-50 rounded-xl">
+                    <div id="qrcodeTls" class="border p-2 bg-white rounded-lg shadow-sm"></div>
                 </div>
             </div>
         </div>
     </div>
 
     <script>
-        function openTab(tabId) {
+        function switchTab(tabId, btn) {
             document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
             document.getElementById(tabId).classList.remove('hidden');
+            
+            document.querySelectorAll('.tab-btn').forEach(el => {
+                el.className = "tab-btn flex-1 text-sm font-medium py-2 rounded-lg text-slate-600 hover:text-slate-900 transition";
+            });
+            btn.className = "tab-btn flex-1 text-sm font-medium py-2 rounded-lg text-indigo-700 bg-white shadow-sm transition";
         }
 
-        // 切换启用服务的表单元素可用状态
+        // 实时获取内核运行状态并在顶部高亮
+        function checkKernelStatus() {
+            fetch('/status')
+            .then(res => res.json())
+            .then(data => {
+                const badge = document.getElementById('statusBadge');
+                const dot = document.getElementById('statusDot');
+                const text = document.getElementById('statusText');
+                
+                if (data.status === 'running') {
+                    badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border border-emerald-100 bg-emerald-50 text-emerald-700";
+                    dot.className = "w-2 h-2 rounded-full bg-emerald-500 animate-pulse";
+                    text.innerText = "运行中";
+                } else {
+                    badge.className = "flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border border-rose-100 bg-rose-50 text-rose-700";
+                    dot.className = "w-2 h-2 rounded-full bg-rose-500";
+                    text.innerText = "已停止";
+                }
+            });
+        }
+
+        setInterval(checkKernelStatus, 3000); // 3秒自动轮询
+
+        function updateSubUrlDisplay(token) {
+            const host = window.location.hostname;
+            const panelPort = window.location.port ? ":" + window.location.port : "";
+            const sanitizedToken = token.replace(/[^a-zA-Z0-9\-_]/g, '');
+            document.getElementById('subUrlInput').value = "http://" + host + panelPort + "/sub/" + sanitizedToken;
+        }
+
+        function randomizeSubToken() {
+            const chars = '0123456789abcdef';
+            let token = '';
+            for (let i = 0; i < 32; i++) {
+                token += chars[Math.floor(Math.random() * 16)];
+            }
+            document.getElementById('subTokenInput').value = token;
+            updateSubUrlDisplay(token);
+        }
+
+        window.addEventListener('DOMContentLoaded', () => {
+            toggleServiceBlocks();
+            updateSubUrlDisplay("{{ config.sub_token }}");
+            checkKernelStatus();
+        });
+
         function toggleServiceBlocks() {
             const rEnabled = document.getElementById('realityEnabledCheckbox').checked;
             const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
@@ -382,28 +481,27 @@ HTML_TEMPLATE = """
             const tFields = document.getElementById('tlsFields');
             
             if (rEnabled) {
-                rFields.classList.remove('opacity-50');
+                rFields.classList.remove('opacity-40');
                 rFields.querySelectorAll('input, button').forEach(el => el.disabled = false);
             } else {
-                rFields.classList.add('opacity-50');
+                rFields.classList.add('opacity-40');
                 rFields.querySelectorAll('input, button').forEach(el => {
                     if (el.id !== 'realityEnabledCheckbox') el.disabled = true;
                 });
             }
             
             if (tEnabled) {
-                tFields.classList.remove('opacity-50');
+                tFields.classList.remove('opacity-40');
                 tFields.querySelectorAll('input, select, radio').forEach(el => el.disabled = false);
-                toggleCertSource(); // 重新加载证书输入框的状态
+                toggleCertSource(); 
             } else {
-                tFields.classList.add('opacity-50');
+                tFields.classList.add('opacity-40');
                 tFields.querySelectorAll('input, select, textarea, radio').forEach(el => {
                     if (el.id !== 'tlsEnabledCheckbox') el.disabled = true;
                 });
             }
         }
 
-        // 切换自签名与手动粘贴的显示状态
         function toggleCertSource() {
             const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
             if (!tEnabled) return;
@@ -423,19 +521,17 @@ HTML_TEMPLATE = """
             }
         }
 
-        window.addEventListener('DOMContentLoaded', () => {
-            toggleServiceBlocks();
-        });
-
         function addUserRow() {
             const container = document.getElementById('usersContainer');
             const row = document.createElement('div');
-            row.className = 'flex gap-2 user-row items-center';
+            row.className = 'flex flex-col sm:flex-row gap-2 user-row items-center bg-slate-50/50 p-3 rounded-xl border border-slate-100';
             row.innerHTML = `
-                <input type="text" name="username[]" placeholder="用户名" class="flex-1 border rounded px-3 py-1.5 text-sm outline-none" required>
-                <input type="text" name="password[]" placeholder="密码" class="flex-1 border rounded px-3 py-1.5 text-sm outline-none" required>
-                <button type="button" class="bg-gray-300 text-gray-500 px-4 py-1.5 rounded text-xs font-bold cursor-not-allowed" disabled>保存后可用</button>
-                <button type="button" onclick="removeUserRow(this)" class="bg-red-500 hover:bg-red-600 text-white px-4 py-1.5 rounded text-xs">删除</button>
+                <input type="text" name="username[]" placeholder="用户名" class="w-full sm:flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                <input type="text" name="password[]" placeholder="密码" class="w-full sm:flex-1 border border-slate-200 rounded-lg px-3 py-1.5 text-sm outline-none bg-white focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required>
+                <div class="flex gap-2 w-full sm:w-auto mt-2 sm:mt-0">
+                    <button type="button" class="flex-1 sm:flex-none bg-slate-300 text-slate-500 px-4 py-1.5 rounded-lg text-xs font-semibold cursor-not-allowed" disabled>保存后可用</button>
+                    <button type="button" onclick="removeUserRow(this)" class="bg-rose-500 hover:bg-rose-600 text-white px-3 py-1.5 rounded-lg text-xs font-semibold transition">删除</button>
+                </div>
             `;
             container.appendChild(row);
         }
@@ -443,7 +539,7 @@ HTML_TEMPLATE = """
         function removeUserRow(btn) {
             const rows = document.querySelectorAll('.user-row');
             if (rows.length > 1) {
-                btn.parentElement.remove();
+                btn.closest('.user-row').remove();
             } else {
                 alert("至少需要保留一个账号！");
             }
@@ -489,19 +585,19 @@ HTML_TEMPLATE = """
             }
 
             const status = document.getElementById('statusMsg');
-            status.className = "text-sm font-semibold text-blue-600";
-            status.innerText = "正在应用配置并重启内核中...";
+            status.className = "text-sm font-semibold text-indigo-600";
+            status.innerText = "⏳ 正在进行端口检测与保存配置中...";
 
             const formData = new FormData(this);
             fetch('/save', { method: 'POST', body: formData })
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    status.className = "text-sm font-semibold text-green-600";
-                    status.innerText = "🎉 保存成功，Sing-box 已重启运行！";
+                    status.className = "text-sm font-semibold text-emerald-600";
+                    status.innerText = "🎉 端口校验通过，配置已成功保存！";
                     setTimeout(() => { location.reload(); }, 1500);
                 } else {
-                    status.className = "text-sm font-semibold text-red-600";
+                    status.className = "text-sm font-semibold text-rose-600";
                     status.innerText = "❌ 失败: " + data.message;
                 }
             });
@@ -512,27 +608,22 @@ HTML_TEMPLATE = """
             e.preventDefault();
             const status = document.getElementById('pwdStatus');
             status.innerText = "正在保存密码...";
-            status.className = "text-sm text-blue-500";
+            status.className = "text-sm text-indigo-600";
 
             const formData = new FormData(this);
             fetch('/change_password', { method: 'POST', body: formData })
             .then(res => res.json())
             .then(data => {
                 if (data.status === 'success') {
-                    status.className = "text-sm text-green-600";
+                    status.className = "text-sm text-emerald-600";
                     status.innerText = "🎉 密码更新成功！";
                     this.reset();
                 } else {
-                    status.className = "text-sm text-red-600";
+                    status.className = "text-sm text-rose-600";
                     status.innerText = "❌ 失败: " + data.message;
                 }
             });
         });
-
-        // 订阅配置路径
-        const host = window.location.hostname;
-        const panelPort = window.location.port ? ":" + window.location.port : "";
-        document.getElementById('subUrlInput').value = "http://" + host + panelPort + "/sub";
 
         function copySubUrl() {
             const input = document.getElementById('subUrlInput');
@@ -541,15 +632,12 @@ HTML_TEMPLATE = """
             alert('订阅链接已复制！');
         }
 
-        // 展示分享二维码及连接
         function showShare(user, pwd) {
             const serverIp = document.querySelector('input[name="server_ip"]').value;
             const rEnabled = document.getElementById('realityEnabledCheckbox').checked;
             const tEnabled = document.getElementById('tlsEnabledCheckbox').checked;
-            
             const encodedPwd = encodeURIComponent(pwd);
             
-            // 是否有 Reality 分享
             if (rEnabled) {
                 const port = document.getElementById('realityPortInput').value;
                 const sni = document.getElementById('realitySniInput').value;
@@ -580,14 +668,12 @@ HTML_TEMPLATE = """
                 document.getElementById('modalRealitySection').classList.add('hidden');
             }
 
-            // 是否有 TLS 节点分享
             if (tEnabled) {
                 const port = document.getElementById('tlsPortInput').value;
                 const sni = document.getElementById('tlsSniInput').value;
                 const certSource = document.querySelector('input[name="cert_source"]:checked').value;
                 const remarks = encodeURIComponent("AnyTLS+TLS-" + user);
                 
-                // 如果是自签名证书，附加 allowInsecure=1 保证客户端可以直接连通
                 let insecureParam = "";
                 if (certSource === 'self_signed') {
                     insecureParam = "&allowInsecure=1";
@@ -639,17 +725,20 @@ LOGIN_TEMPLATE = """
     <title>登录 Sing-box 配置面板</title>
     <meta charset="utf-8">
     <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
 </head>
-<body class="bg-gray-100 flex items-center justify-center min-h-screen">
-    <div class="bg-white p-8 rounded-lg shadow-md w-full max-w-sm">
-        <h2 class="text-xl font-bold mb-4 text-center text-indigo-600">Sing-box 配置面板</h2>
-        {% if error %}<div class="bg-red-100 text-red-700 p-2 rounded mb-4 text-sm">{{ error }}</div>{% endif %}
+<body class="bg-slate-50 flex items-center justify-center min-h-screen p-4" style="font-family: 'Inter', sans-serif;">
+    <div class="bg-white p-8 rounded-2xl shadow-sm border border-slate-100 w-full max-w-md space-y-6">
+        <div class="text-center space-y-2">
+            <h2 class="text-2xl font-bold tracking-tight text-slate-900">AnyTLS 控制台</h2>
+            <p class="text-sm text-slate-400">请输入安全管理密码进行身份验证</p>
+        </div>
+        {% if error %}<div class="bg-rose-50 text-rose-600 border border-rose-100 p-3 rounded-xl text-center text-sm font-medium">{{ error }}</div>{% endif %}
         <form action="/login" method="POST" class="space-y-4">
             <div>
-                <label class="block text-sm text-gray-600">请输入登录密码</label>
-                <input type="password" name="password" class="w-full border rounded px-3 py-2 outline-none focus:ring-2 focus:ring-indigo-400" required autofocus>
+                <input type="password" name="password" placeholder="请输入管理密码" class="w-full border border-slate-200 rounded-xl px-4 py-3 text-sm outline-none focus:border-indigo-500 focus:ring-1 focus:ring-indigo-500 transition" required autofocus>
             </div>
-            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-2 rounded">进入面板</button>
+            <button type="submit" class="w-full bg-indigo-600 hover:bg-indigo-700 text-white font-semibold py-3 rounded-xl transition shadow-md shadow-indigo-100">验证并进入面板</button>
         </form>
     </div>
 </body>
@@ -676,7 +765,14 @@ def logout():
     session.pop('logged_in', None)
     return redirect('/')
 
-# 实时调用内核生成公钥/私钥对
+# 内核运行状态接口
+@app.route('/status')
+def status_route():
+    global sb_process
+    if sb_process and sb_process.poll() is None:
+        return jsonify({'status': 'running'})
+    return jsonify({'status': 'stopped'})
+
 @app.route('/generate_keys')
 def generate_keys_route():
     if not session.get('logged_in'):
@@ -698,16 +794,19 @@ def generate_keys_route():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)})
 
-# 生成随机 Short ID
 @app.route('/generate_short_id')
 def generate_short_id_route():
     if not session.get('logged_in'):
         return jsonify({'status': 'error', 'message': '未登录'})
     return jsonify({'short_id': secrets.token_hex(8)})
 
-# 动态订阅接口 (根据开启的服务自动汇出相应节点)
-@app.route('/sub')
-def sub_route():
+# 动态安全订阅路由
+@app.route('/sub/<token>')
+def sub_route(token):
+    correct_token = get_sub_token()
+    if token != correct_token:
+        return "Not Found", 404
+        
     config = load_config_data()
     server_ip = get_server_ip()
     
@@ -715,13 +814,13 @@ def sub_route():
     for u, p in config['users']:
         encoded_pwd = urllib.parse.quote(p)
         
-        # 1. 汇出 Reality 节点
+        # 1. Reality 节点
         if config['reality_enabled']:
             remarks_r = urllib.parse.quote(f"AnyTLS+Reality-{u}")
             link_r = f"anytls://{encoded_pwd}@{server_ip}:{config['reality_port']}?security=reality&sni={urllib.parse.quote(config['reality_sni'])}&fp=chrome&pbk={urllib.parse.quote(config['public_key'])}&sid={urllib.parse.quote(config['short_id'])}&type=tcp#{remarks_r}"
             links.append(link_r)
             
-        # 2. 汇出 Standard TLS 节点
+        # 2. Standard TLS 节点
         if config['tls_enabled']:
             remarks_t = urllib.parse.quote(f"AnyTLS+TLS-{u}")
             
@@ -735,6 +834,18 @@ def sub_route():
     sub_str = "\n".join(links)
     b64_sub = base64.b64encode(sub_str.encode('utf-8')).decode('utf-8')
     return b64_sub, 200, {'Content-Type': 'text/plain; charset=utf-8'}
+
+@app.route('/sub')
+def sub_block():
+    return "Not Found", 404
+
+@app.route('/reset_sub_token')
+def reset_sub_token_route():
+    if not session.get('logged_in'):
+        return jsonify({'status': 'error', 'message': '未登录'})
+    new_token = secrets.token_hex(16)
+    write_file_content(SUB_TOKEN_PATH, new_token)
+    return jsonify({'status': 'success', 'token': new_token})
 
 @app.route('/change_password', methods=['POST'])
 def change_password():
@@ -752,9 +863,19 @@ def save_config():
     if not session.get('logged_in'):
         return jsonify({'status': 'error', 'message': '未登录'})
         
+    global sb_process
+    old_process = sb_process
+    
     try:
         server_ip = request.form.get('server_ip')
         write_file_content(IP_PATH, server_ip)
+        
+        # 提取并保存 Token
+        sub_token_raw = request.form.get('sub_token', '').strip()
+        sub_token = ''.join(c for c in sub_token_raw if c.isalnum() or c in '-_')
+        if not sub_token:
+            sub_token = secrets.token_hex(16)
+        write_file_content(SUB_TOKEN_PATH, sub_token)
         
         # 提取账户和混淆参数
         usernames = request.form.getlist('username[]')
@@ -771,10 +892,43 @@ def save_config():
         padding_scheme_raw = request.form.get('padding_scheme')
         padding_scheme = [line.strip() for line in padding_scheme_raw.strip().split('\n') if line.strip()]
         
+        reality_enabled = request.form.get('reality_enabled') == 'on'
+        tls_enabled = request.form.get('tls_enabled') == 'on'
+        
+        # 1. 为了确保安全可靠的检测，暂时停止当前的 Sing-box 释放它自己的端口
+        if sb_process:
+            try:
+                sb_process.terminate()
+                sb_process.wait(timeout=2)
+            except:
+                pass
+            sb_process = None
+
+        # 2. 对将要启用的新端口进行前置占用测试 (排除被 Nginx 或宿主机其他进程占用的可能)
+        occupied_ports = []
+        if reality_enabled:
+            reality_port = request.form.get('reality_port')
+            if is_port_occupied(reality_port):
+                occupied_ports.append(f"Reality ({reality_port} 端口)")
+                
+        if tls_enabled:
+            tls_port = request.form.get('tls_port')
+            if is_port_occupied(tls_port):
+                occupied_ports.append(f"Standard TLS ({tls_port} 端口)")
+                
+        if occupied_ports:
+            # 检测到端口占用，恢复运行之前的正常进程并直接拒绝保存
+            if old_process:
+                restart_singbox_kernel()
+            return jsonify({
+                'status': 'error', 
+                'message': f"端口占用冲突！以下配置端口已被宿主机的其他程序占用，请排查或更换端口后再试：{', '.join(occupied_ports)}"
+            })
+            
+        # 3. 校验通过，开始写入新配置文件
         inbounds = []
         
-        # 服务 1: Reality 入站
-        reality_enabled = request.form.get('reality_enabled') == 'on'
+        # Reality 入站构建
         if reality_enabled:
             reality_port = request.form.get('reality_port')
             reality_sni = request.form.get('reality_sni')
@@ -806,8 +960,7 @@ def save_config():
                 }
             })
             
-        # 服务 2: TLS 证书入站
-        tls_enabled = request.form.get('tls_enabled') == 'on'
+        # TLS 证书入站构建
         if tls_enabled:
             tls_port = request.form.get('tls_port')
             tls_sni = request.form.get('tls_sni')
@@ -816,12 +969,13 @@ def save_config():
             write_file_content(CERT_SOURCE_PATH, cert_source)
             
             if cert_source == 'self_signed':
-                # 自动生成自签名证书
                 success = generate_self_signed_cert(tls_sni, CERT_FILE, KEY_FILE)
                 if not success:
-                    return jsonify({'status': 'error', 'message': '自签名证书生成失败，请确认系统已正确安装 OpenSSL！'})
+                    # 恢复原进程
+                    if old_process:
+                        restart_singbox_kernel()
+                    return jsonify({'status': 'error', 'message': '自签名证书生成失败，请确认环境是否具备 OpenSSL 指令集。'})
             else:
-                # 写入用户手动粘贴的证书内容
                 cert_content = request.form.get('cert_content', '')
                 key_content = request.form.get('key_content', '')
                 write_file_content(CERT_FILE, cert_content)
@@ -848,10 +1002,14 @@ def save_config():
         with open(CONFIG_PATH, 'w') as f:
             json.dump(new_json_data, f, indent=4)
             
+        # 重启 Sing-box
         restart_singbox_kernel()
         return jsonify({'status': 'success'})
         
     except Exception as e:
+        # 万一崩溃，启动旧内核兜底
+        if old_process:
+            restart_singbox_kernel()
         return jsonify({'status': 'error', 'message': str(e)})
 
 if __name__ == '__main__':
